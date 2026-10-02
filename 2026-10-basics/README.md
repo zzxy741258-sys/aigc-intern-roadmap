@@ -5,4 +5,5 @@ README / requirements / configs / src / scripts / tests。
 9.26： 看完python 1-5节 学习git操作
 9.27： 看完d2l 2.1 跟敲代码
 9.30:  看完d2l 2.3 跟敲代码
+10.1\10.2:看完d2l 2.5 2.6 跟敲代码 手写线性回归和softmax回归
 
