@@ -12,10 +12,11 @@ x.grad.zero_()
 y=x*x
 
 y.backward(torch.ones(len(x)))
-print(x.grad)
+
 x.grad.zero_()
 y=x*x
 u=y.detach()
 z=u*x
 z.backward(torch.ones(len(x)))
-print(x.grad==u)
+
+x.grad.zero_()
