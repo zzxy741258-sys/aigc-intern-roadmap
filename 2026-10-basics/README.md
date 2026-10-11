@@ -22,3 +22,8 @@ python src/w3_fashion_mnist.py --resume   # 从 best_model.pt 断点续跑
 - 随机种子：torch.manual_seed(0)
 - 断点恢复：已验证可续跑
 
+## W4 CIFAR-10 CNN 与实验记录
+- 模型：CNN(3-6-16, FC 400-120-84-10)，SGD lr=0.001 momentum=0.9，batch 64
+- 结果：val_acc 0.62（Dropout 版）；混淆矩阵显示 cat↔dog 互混最严重（349 次）
+- 过拟合实验：40 epoch 时 train 0.78 / val 0.64（gap 14%）→ 加 Dropout(0.5) 后 gap 缩至 3.6%
+- 产物：w4_overfit_report.md、confusion_matrix.png、wrong_samples.png
