@@ -25,13 +25,17 @@ BLOCK_SIZE = 64     # 每条样本喂给模型的字符数（就是 W6 说的序
 BATCH_SIZE = 32     # 一个 batch 里几条样本
 TRAIN_RATIO = 0.9   # 训练 / 验证划分
 
-OUT_DIR = "data"
+# 路径以「本文件所在目录」为基准，避免从 src/ 或仓库根目录运行时读到不同语料
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+OUT_DIR = os.path.join(ROOT, "data")
 OUT_PATH = os.path.join(OUT_DIR, "w7_corpus.txt")
 
 # 语料来源：本地已有文本，零下载
 SOURCES = (
-    sorted(glob.glob("notes/*.md"))
-    + ["README.md"]
+    sorted(glob.glob(os.path.join(ROOT, "notes", "*.md")))
+    + [os.path.join(ROOT, "README.md")]
     + [
         r"E:\workbuddy\2026-10-24-07-50-47\calendar_full.txt",
         r"E:\workbuddy\2026-10-24-07-50-47\mianjing_full.txt",
@@ -122,7 +126,7 @@ def split_train_val(data, ratio=TRAIN_RATIO):
     #         提示：data 是一个一维 tensor，切分点 = int(len(data) * ratio)
     #         注意：验证集必须是「文本的尾部」，不能随机抽 —— 随机抽会让
     #         相邻字符同时出现在训练集和验证集，等于提前泄题。
-    split_idx = ...   # <-- 改这里
+    split_idx = int(len(data) * ratio)   # <-- 改这里
     return data[:split_idx], data[split_idx:]
 
 
@@ -137,14 +141,14 @@ def get_batch(data, block_size=BLOCK_SIZE, batch_size=BATCH_SIZE):
     #         思路：起点 i 最大只能到 len(data) - block_size - 1，
     #         否则 y = data[i+1 : i+1+block_size] 会越界（y 比 x 多看一位）。
     #         而 torch.randint(hi, ...) 取的是 [0, hi)，所以 hi 要比最大起点大 1。
-    hi = ...   # <-- 改这里
+    hi = len(data) - block_size   # <-- 改这里
     ix = torch.randint(hi, (batch_size,))
 
     x = torch.stack([data[i: i + block_size] for i in ix])
 
     # TODO-3  构造答案 y：从每个起点 i+1 开始，取 block_size 个字符。
     #         写完后检查：y 的形状必须和 x 完全一样，都是 (batch_size, block_size)。
-    y = ...   # <-- 改这里
+    y = torch.stack([data[i + 1: i + 1 + block_size] for i in ix])   # <-- 改这里
     return x, y
 
 

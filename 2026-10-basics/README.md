@@ -328,10 +328,240 @@ BLEU 变好是因为：翻译有多个正确版本，平滑后模型不再把其
 
 **工程结论**：主流 `D` 为 4096—8192 → `4D` = 16K—32K。扩到 32K 以上注意力成主成本，必须改架构（MQA/GQA、FlashAttention、稀疏/线性注意力），不是加卡。
 
-### 下周问题清单（W7：Transformer 与 tokenizer）
-0. **W6 顺延**：读 Attention Is All You Need 第 3—5 节（重点 §4 Why Self-Attention，即复杂度对比表）+ D2L 注意力章节
-1. BPE 的 `merges` 为什么必须严格按学到的顺序执行？（W7 自检第 3 题，未答）
-2. 真实模型的 base 词表是「字节」还是「字符」？一个汉字 UTF-8 占 3 字节，这能解释中文比英文更费 token 吗？
-3. causal mask 在字符级语言模型里具体加在哪一步？
-4. checkpoint 恢复为什么要同时存 optimizer state？只存模型权重会丢什么？
-5. W6 遗留：LeetCode 242、349（W5 暂缓）仍未做
+---
+
+# W7 · Transformer 与 tokenizer（11.09—11.15，实际 10.27—11.02）
+
+> 一句话：这周从「文本」走到了「能自己写字的小模型」，六站全部跑通，两条硬验收（生成 200 字 + checkpoint 恢复）都拿到。
+> 全程 **CPU 完成**，不需要 GPU —— 6GB 显卡在这周完全没参与。
+
+## 六站流水线（所有文件都挂在这六个格子里）
+
+| 站 | 输入 → 输出 | 做什么 | 落在哪个文件 |
+|---|---|---|---|
+| ① 切分 | 一维文本 → `(B, T)` | 按字符/子词切，查表变整数 | `w7_bpe_demo.py`、`w7_tokenizer.py`、`w7_corpus.py` |
+| ② 查表 | `(B, T)` → `(B, T, 64)` | 每个整数取一行向量，加位置向量 | `w7_tiny.py`、`w7_model.py` 前半 |
+| ③ 混合 | `(B, T, 64)` → `(B, T, 64)` | attention 交换信息 + FFN 各自变换 | `w7_block.py`、`w7_gpt.py` |
+| ④ 打分 | `(B, T, 64)` → `(B, T, 1220)` | 乘共享嵌入矩阵，对每个字之后的所有可能打分 | `w7_model.py` 的 `lm_head` |
+| ⑤ 对答案 | `(B, T, 1220)` + `(B, T)` → 一个数 | 交叉熵，所有位置平均 | `w7_model.py` 的 `lm_loss` |
+| ⑥ 更新 | 一个数 → 新参数 | 反向传播 + 优化器，回到 ② | `w7_train.py`、`w7_generate.py` |
+
+**贯穿全流程的一句话：B 和 T 从头不动，只有最后一维在变：无 → 64 → 64 → 1220 → 一个数。**
+
+## 本周任务（对照日历 W7 表 2 + 表 8）
+
+| # | 日历要求 | 结果 |
+|---|---|---|
+| T1 | HF LLM Course 第 1—2 章 | ⬜ **顺延至 W8**（见未完成项） |
+| T2 | 学习 BPE | ✅ 手算 10 轮 + 库训练对照 |
+| T3 | token 与 position embedding | ✅ 手算 + 代码 |
+| T4 | causal LM | ✅ 因果性测试精确 0 |
+| T5 | 训练字符级 LM（单头/多头，生成 200 字） | ✅ 两版都跑 |
+| T6 | 记录 perplexity | ✅ 随 checkpoint 记录 |
+| A1 | 能解释 causal mask | ✅ 复验通过 |
+| A2 | 生成脚本可从 checkpoint 恢复 | ✅ `del model` 后仍能生成 |
+| — | 刷题 704、35 | ✅ |
+| — | 八股 0.5h（tokenizer 类） | ✅ BPE/WordPiece/SentencePiece + 中文成本 |
+| L2 | HF Tokenizers 文档 | ⬜ 顺延至 W8 |
+| L3 | 单头 / 多头两版对照 | ✅ **对账抓出来的缺口，已补** |
+| — | CPU 小数据对照实验环境（10.28 补充修订） | ✅ 600 步 15 秒，改超参循环 5 分钟内 |
+
+## 关键数字
+
+### ① BPE：手算与工业实现对照
+
+语料只有 4 个词（low:5 / lower:2 / newest:6 / widest:3），第 1 轮有三个对并列 9 次，取第一个 `e+s`。
+
+| | 初始符号 | 合并次数 | 词表 | `lowest` 切法 |
+|---|---|---|---|---|
+| 手算 | 11 | 10 | 21 | `low + est</w>` = 2 |
+| `tokenizers` 库 | 14 | 7 | 21 | `lo + w + est</w>` = 3 |
+
+**差 3 个初始符号，是因为库自动把「词尾字符」单列（`w</w>`、`r</w>`、`t</w>`）。**
+
+> **工程铁律：不能用 A 库训的词表和 B 库的 token id 混用。** 换库、换版本、换语料顺序，id 全变。
+
+### ② 语料与数据管道
+
+```
+原始文本（本地 notes + README + 日历 + 面经）85,905 字符
+  → 去代码块 / 去表格行 / 只保留中文占比 ≥35% 的行
+最终语料 32,953 字符，词表 1,220 个字符
+训练 / 验证 = 29,657 / 3,296（按尾部切，不随机抽）
+每条样本 64 字符 × 32 条 = 2,048 个预测位置 / 步
+```
+
+**「中文占比 35%」这个阈值扫了 5 档定下来的**：50% 只剩 2 万字（几分钟背下来），25% 混进大量英文符号（生成乱码）。
+
+### ③ 模型与初始 loss
+
+```
+骨架（嵌入 + 位置 + LN + 输出头）   82,304
+一个 block（12d² + 2×LN）          49,408
+2 层 block                         98,816
+合计                              181,120
+```
+
+**初始 loss = 7.0902，ln(1220) = 7.1066，差 0.0164。**
+
+这条是整周的体检线：**随机初始化时模型只能在 1220 个字里均匀猜，交叉熵必然是 ln(V)。** 大于它 = 比乱猜还差 = 接线错了。
+
+反面实测：把初始化从 `std=0.02` 改成 PyTorch 默认 `std=1.0`，同一份代码 loss 直接变成 **42.7730**。
+
+### ④ 训练曲线（600 步，CPU 15 秒）
+
+| 步 | 训练 | 验证 | 困惑度 |
+|---|---|---|---|
+| 0 | 7.1027 | 7.0903 | 1200.33 |
+| 200 | 4.4639 | 4.7765 | 118.69 |
+| 400 | 3.8198 | 4.4048 | 81.84 |
+| 600 | 3.4576 | 4.3407 | 76.76 |
+
+**最终：训练 3.4687 / 验证 4.2873 / 困惑度 72.77**（20 个 batch 平均）
+
+**验证集在 500 步后不再下降（4.3406 → 4.3407），训练集还在降** —— 这是过拟合的起点，也决定了 checkpoint 存哪一步。
+
+### ⑤ 训更久反而更差
+
+| 步数 | 验证 loss | 困惑度 |
+|---|---|---|
+| **600** | **4.1970** | **66.48** |
+| 1500 | 4.6743 | 107.16 |
+
+**181,120 个参数对着 29,657 个字符，600 步之后开始背答案。** 结论：checkpoint 存「验证集最好」那一步，不存最后一步。
+
+### ⑥ 因果性（堆 2 层后）
+
+```
+位置 0—62 的最大变化 : 0.0000000000   ← 精确 0
+位置 63  的最大变化 : 0.9119579792   ← 动了
+去掉 mask 时位置 0—62 变化 : 2.571e-03  ← 泄漏了
+```
+
+**堆 2 层仍是精确 0，比单层是 0 强得多** —— 任何一层漏 mask，上层就会把泄漏带下来。
+
+**为什么是精确 0 而不是 1e-8**：`exp(-inf) = 0.0` 在 IEEE 754 里是精确值，整条链没有舍入。
+
+### ⑦ 单头 vs 多头（L3 对照）
+
+| n_head | 每头维度 | 参数量 | 训练 | 验证 |
+|---|---|---|---|---|
+| 1 | 64 | 181,120 | 3.4698 | **4.2844** |
+| 4 | 16 | 181,120 | **3.4262** | 4.2897 |
+
+**参数量完全相同，验证集打平（差 0.005，噪声范围内）。**
+
+多头训练集更低、验证集更高 —— 拟合更好但没转化成泛化。原因：语料只有 3 万字、模型只有 2 层，**没有足够的多样性让 4 个头分工**。
+
+> 面试话术：多头不是无条件更好，它需要「有东西可分」这个前提。业界 d_head=128 这个经验值就是在保证每头的维度足够。
+
+### ⑧ 中文 token 成本（`w8_tokenizer_smoke.py`）
+
+同一句 13 汉字 / 7 英文词，三种分词器：
+
+| 分词器 | 中文 | 英文 | 比值 |
+|---|---|---|---|
+| distilbert（英文词表） | 13（大半 `[UNK]`） | 8 | 1.6x（数字无意义） |
+| **gpt2（字节级）** | **28** | **8** | **3.5x** |
+| **bert-base-chinese（中文字级）** | **13** | **12** | **1.1x** |
+
+**「中文比英文贵 3 倍」只对字节级分词器成立。** 贵不贵取决于词表，不取决于语言。
+
+另一个实测：distilbert 词表 30,522 个 token 里，**单字汉字只有 244 个（0.8%）**，所以 `机器学习` → `['[UNK]','[UNK]','学','[UNK]']`。
+
+**「部分可用」比「全废」更危险** —— 序列看着能跑，语义已缺一半，不报错。
+
+## 失败案例与教训（含我自己犯的错）
+
+| # | 现象 | 根因 | 教训 |
+|---|---|---|---|
+| 1 | 残差实验测「第一层梯度范数」，无残差反而更大 | **测错了指标**：梯度范数反映子层影响力，有残差时子层本就只做小改动 | 改测「输出还认不认得输入」（cos），16 层后 0.72 vs 0.006 |
+| 2 | `ln1` 写成 `ln2`，几乎没差别（差 0.007） | LayerNorm 初始 γ=1、β=0，两者初始是同一函数 | **不报错、形状对、查不出的错最危险** |
+| 3 | `drop` 包住整个 `x + 子层` | 噪声撒到恒等直通路上 | 验证集差 0.25（4.4330 vs 4.0658） |
+| 4 | 漏 `zero_grad()` | `.backward()` 是**累加**不是覆盖 | loss 停在 6.5 抖，600 步 6.5227 vs 3.4576，**不报错** |
+| 5 | 我断言「英文词表下中文全 UNK」，脚本断言失败 | 词表里碰巧收了 244 个汉字 | **断言写错比代码写错更危险**，它把错误结论固化 |
+| 6 | 我断言「中文贵 3 倍」 | 只对字节级成立，中文词表是 1.1x | 结论要标适用范围，不能一概而论 |
+| 7 | 我在 `w7_generate.py` 里写了段训练 loss 的错表达式 | 顺手写的表达式没验证 | 演示脚本里混训练逻辑本身是设计问题 |
+
+**共同点：前 4 条全部「不报错、形状对、浅层看不出」** —— 只能靠对照实验发现，不能靠读代码。
+
+## 本周提交
+
+```
+src/w7_bpe_demo.py      BPE 手算全过程（纯标准库）
+src/w7_tokenizer.py     tokenizers 库自训词表，与手算对照
+src/w7_corpus.py        语料清洗 + 词表 + 训练/验证切分 + batch
+src/w7_tiny.py          裸张量版五步：查表→加位置→打分→softmax→loss
+src/w7_model.py         模型骨架（嵌入 + 位置 + 权重共享输出头）
+src/w7_block.py         单个 Transformer block（裸张量，含因果性验证）
+src/w7_gpt.py           装进 nn.Module，堆 2 层
+src/w7_train.py         训练循环 + 体检函数 + 两道守卫
+src/w7_generate.py      生成 + checkpoint 保存/恢复 + 词表偏移实证
+src/w7_multihead.py     单头 / 多头对照实验
+src/w8_tokenizer_smoke.py  W8 前置：AutoTokenizer 七段冒烟
+
+notes/w7_bpe.md         BPE 完整讲义（10 轮真实 trace + 词表算术）
+notes/w7_skeleton.md    六站骨架图（一页）
+notes/w7_checklist.md   逐条对账清单（日历原文对齐）
+notes/hf_course_guide.md  HF LLM Course 1—2 章导读 + 5 道必答题
+
+data/w7_corpus.txt      清洗后语料（32,953 字符）
+data/w7_ckpt.pt         checkpoint（2,160 KB）
+```
+
+## 运行（W7 脚本）
+
+```powershell
+cd "D:\Agent learning\aigc-intern-roadmap\2026-10-basics"
+
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_bpe_demo.py      # BPE 十轮
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_tokenizer.py     # 库训练词表
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_corpus.py        # 语料与 batch
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_tiny.py          # 裸张量五步
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_model.py         # 骨架 + 初始 loss
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_block.py         # 单 block + 因果性
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_gpt.py           # 堆 2 层 + 残差实验
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_train.py         # 训练 600 步
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_generate.py      # 生成 + checkpoint
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w7_multihead.py     # 单头/多头对照
+& "D:\anaconda3\envs\aigc\python.exe" -X utf8 src\w8_tokenizer_smoke.py  # 分词器冒烟
+```
+
+## 本周未完成项（对账发现，如实记录）
+
+| 漏项 | 原因 | 去处 |
+|---|---|---|
+| **HF LLM Course 第 1—2 章**（T1） | 是"看网页"，没有可运行的产出，容易觉得"讲完了就等于看了" | **移到 W8 开工前置，75 分钟，硬门禁：`notes/hf_course_guide.md` 5 题答完才能开 W8** |
+| **HF Tokenizers 文档**（L2） | 同上，而且讲义里已讲 BPE，容易以为不必看原文 | W8 前置，30 分钟，只看三点：BPE/WordPiece/SentencePiece 区别、special tokens、padding 与 truncation |
+
+**这两项不是"忘了"，是"知道但一直往后放"。** 已确认它们不阻塞 W7 任何技术产出（W7 用字符级词表，全程没碰 `AutoTokenizer`），但会阻塞 W8 第一天。
+
+## 环境记录：HF 下载的可用路径（重要）
+
+| 路径 | 结果 |
+|---|---|
+| `huggingface.co` 直连 | ❌ 不通 |
+| `HF_ENDPOINT=hf-mirror` 走默认缓存 | ❌ 卡死被杀（`snapshots/` 目录为空，`blobs/` 里有文件） |
+| **`hf_hub_download(..., local_dir="models/xxx")`** | ✅ **可用**，14.5 秒下完 |
+
+```python
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+from huggingface_hub import hf_hub_download
+for f in ["config.json", "tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"]:
+    hf_hub_download("gpt2", f, local_dir="models/gpt2")
+# 之后一律 AutoTokenizer.from_pretrained("models/gpt2")
+```
+
+**以后所有 HF 模型都走这个模式：先下到 `models/`，再用本地路径加载，不依赖默认缓存。**
+
+已就位：`models/gpt2`（50257）、`models/distilbert-base-uncased`（30522）、`models/bert-base-chinese`（21128）。
+
+## 下周问题清单（W8：DistilBERT 情感分类）
+
+0. **W7 顺延（硬门禁）**：HF LLM Course 1—2 章 + Tokenizers 文档，`notes/hf_course_guide.md` 5 题答完才能开 W8
+1. `attention_mask` 传进去是自动生效的吗？如果不是，它在模型内部做什么？
+2. 分类任务为什么取第一个位置的输出？`[CLS]` 是分词器自动加的，GPT 系为什么没有？
+3. 全参微调 DistilBERT（66M）在 6GB 上能不能做？不能的话第一步该冻哪一层？
+4. W6/W7 遗留：LeetCode 242、349（W5 暂缓）仍未做
+5. checkpoint 恢复为什么要同时存 optimizer state？（W7 自检第 4 题，到现在还没答）
